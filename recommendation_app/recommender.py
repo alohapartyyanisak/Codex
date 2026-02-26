@@ -213,18 +213,40 @@ def _zscore(frame: pd.DataFrame) -> pd.DataFrame:
 
 def recommend_tracks(
     data: pd.DataFrame,
-    seed_display_name: str,
+    seed_display_name: str | list[str] | dict[str, float],
     mood: str,
     spotify_weight: float,
     discovery_mode: float,
     top_k: int = 12,
 ) -> pd.DataFrame:
-    if seed_display_name not in set(data["display_name"]):
-        raise ValueError("Selected track was not found in the dataset.")
+    valid_names = set(data["display_name"])
+    seed_weights: dict[str, float] = {}
+
+    if isinstance(seed_display_name, str):
+        if seed_display_name not in valid_names:
+            raise ValueError("Selected track was not found in the dataset.")
+        seed_weights = {seed_display_name: 1.0}
+    elif isinstance(seed_display_name, dict):
+        for name, weight in seed_display_name.items():
+            if name in valid_names:
+                seed_weights[name] = float(weight or 0.0)
+    else:
+        for name in seed_display_name:
+            if name in valid_names:
+                seed_weights[str(name)] = seed_weights.get(str(name), 0.0) + 1.0
+
+    seed_weights = {name: weight for name, weight in seed_weights.items() if weight > 0}
+    if not seed_weights:
+        raise ValueError("No valid seed tracks were selected.")
+
+    total_weight = float(sum(seed_weights.values()))
+    seed_weights = {name: (weight / total_weight) for name, weight in seed_weights.items()}
 
     features = _zscore(data[FEATURE_COLUMNS].astype(float))
-    seed_index = int(data.index[data["display_name"] == seed_display_name][0])
-    target = features.loc[seed_index].copy()
+    target = pd.Series(0.0, index=features.columns)
+    for seed_name, seed_weight in seed_weights.items():
+        seed_index = int(data.index[data["display_name"] == seed_name][0])
+        target += features.loc[seed_index] * seed_weight
 
     for feature_name, delta in MOOD_ADJUSTMENTS.get(mood, {}).items():
         if feature_name in target.index:
@@ -254,7 +276,7 @@ def recommend_tracks(
     scored["discovery_score"] = discovery_score
     scored["recommendation_score"] = final_score
 
-    results = scored.loc[scored["display_name"] != seed_display_name]
+    results = scored.loc[~scored["display_name"].isin(seed_weights.keys())]
     results = results.sort_values(["recommendation_score", "momentum_score"], ascending=False)
     return results.head(top_k).reset_index(drop=True)
 
