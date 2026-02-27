@@ -90,6 +90,13 @@ PERSONALITY_PROFILES = {
         },
     },
 }
+QUICK_VIBE_DEFAULTS = {
+    "Party Starter": {"mood": "High Energy", "spotify_weight_pct": 55, "discovery_hits_pct": 85},
+    "Late Night Chill": {"mood": "Chill", "spotify_weight_pct": 60, "discovery_hits_pct": 45},
+    "Focus Flow": {"mood": "Balanced", "spotify_weight_pct": 50, "discovery_hits_pct": 55},
+    "Uplift Me": {"mood": "Uplifting", "spotify_weight_pct": 55, "discovery_hits_pct": 70},
+    "Underground Explorer": {"mood": "Dark", "spotify_weight_pct": 50, "discovery_hits_pct": 20},
+}
 
 
 def apply_theme() -> None:
@@ -190,6 +197,14 @@ def apply_theme() -> None:
           color: var(--gold-soft) !important;
           margin-right: 5px;
           margin-top: 8px;
+        }
+        .action-title {
+          font-size: 1.45rem;
+          font-weight: 800;
+          color: var(--gold-soft) !important;
+          letter-spacing: 0.2px;
+          margin-top: 6px;
+          margin-bottom: 8px;
         }
         [data-testid="stSidebar"] {
           background: linear-gradient(180deg, #0c0c0c, #131313);
@@ -435,6 +450,48 @@ def prepare_music_data_cached(raw_df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
+def recommend_tracks_cached(
+    data: pd.DataFrame,
+    seed_weight_items: tuple[tuple[str, float], ...],
+    mood: str,
+    spotify_weight: float,
+    discovery_mode: float,
+    top_k: int,
+    exclude_seed_tracks: bool,
+    preferred_artist_weight_items: tuple[tuple[str, float], ...],
+) -> pd.DataFrame:
+    seed_weights = {str(name): float(weight) for name, weight in seed_weight_items}
+    preferred_artist_weights = {str(name): float(weight) for name, weight in preferred_artist_weight_items}
+    return recommend_tracks(
+        data=data,
+        seed_display_name=seed_weights,
+        mood=mood,
+        spotify_weight=spotify_weight,
+        discovery_mode=discovery_mode,
+        top_k=top_k,
+        exclude_seed_tracks=exclude_seed_tracks,
+        preferred_artist_weights=preferred_artist_weights,
+    )
+
+
+@st.cache_data(show_spinner=False)
+def build_duration_playlist_cached(
+    recommendations: pd.DataFrame,
+    target_minutes: int,
+    tolerance_minutes: int,
+    candidate_limit: int,
+    max_tracks: int,
+) -> pd.DataFrame:
+    return build_duration_playlist(
+        recommendations=recommendations,
+        target_minutes=target_minutes,
+        tolerance_minutes=tolerance_minutes,
+        candidate_limit=candidate_limit,
+        max_tracks=max_tracks,
+    )
+
+
+@st.cache_data(show_spinner=False)
 def get_seed_ui_options(data: pd.DataFrame) -> tuple[list[str], list[str], list[str], list[str]]:
     song_options = sorted(data["display_name"].astype(str).unique().tolist())
     artist_options = sorted(data["artist"].astype(str).unique().tolist())
@@ -627,10 +684,23 @@ def render_toggle_chips(
 
 
 def best_track_for_artist(data: pd.DataFrame, artist_name: str) -> str | None:
-    artist_rows = data.loc[data["artist"] == artist_name]
-    if artist_rows.empty:
+    artist_rows = data.loc[data["artist"] == artist_name].copy()
+
+    artist_key = re.sub(r"[^a-z0-9 ]+", " ", str(artist_name).lower()).strip()
+    featured_rows = data.head(0).copy()
+    if artist_key and "featured_artist_norms" in data.columns:
+        featured_mask = data["featured_artist_norms"].fillna("").astype(str).str.contains(
+            rf"(^|\|){re.escape(artist_key)}(\||$)",
+            regex=True,
+        )
+        featured_rows = data.loc[featured_mask].copy()
+
+    candidate_rows = pd.concat([artist_rows, featured_rows], ignore_index=False)
+    candidate_rows = candidate_rows.drop_duplicates(subset=["display_name"], keep="first")
+    if candidate_rows.empty:
         return None
-    best = artist_rows.sort_values(["momentum_score", "views", "stream"], ascending=False).iloc[0]
+
+    best = candidate_rows.sort_values(["momentum_score", "views", "stream"], ascending=False).iloc[0]
     return str(best["display_name"])
 
 
@@ -769,23 +839,77 @@ def _build_seed_weights_from_state(data: pd.DataFrame) -> dict[str, float]:
     return {name: weight / total_weight for name, weight in seed_weights.items()}
 
 
-def render_seed_experience(data: pd.DataFrame) -> dict[str, float]:
+def _build_preferred_artist_weights(data: pd.DataFrame) -> dict[str, float]:
+    artist_counts: dict[str, float] = {}
+
+    for artist_name in st.session_state.get("selected_seed_artists", []):
+        key = str(artist_name).strip()
+        if key:
+            artist_counts[key] = artist_counts.get(key, 0.0) + 1.0
+
+    selected_songs = [str(song).strip() for song in st.session_state.get("selected_seed_songs", []) if str(song).strip()]
+    if selected_songs:
+        song_artist_lookup = (
+            data.loc[data["display_name"].isin(selected_songs), ["display_name", "artist"]]
+            .drop_duplicates(subset=["display_name"], keep="first")
+            .set_index("display_name")["artist"]
+            .to_dict()
+        )
+        for song_name in selected_songs:
+            artist_name = str(song_artist_lookup.get(song_name, "")).strip()
+            if artist_name:
+                artist_counts[artist_name] = artist_counts.get(artist_name, 0.0) + 1.0
+
+    total = float(sum(artist_counts.values()))
+    if total <= 0:
+        return {}
+    return {artist: (count / total) for artist, count in artist_counts.items()}
+
+
+def render_seed_experience(data: pd.DataFrame) -> tuple[dict[str, float], dict[str, Any]]:
     _init_seed_selection_state(data)
-    st.subheader("DJ Mixing Station")
     song_options, artist_options, quick_top_songs, quick_top_artists = get_seed_ui_options(data)
 
-    mode_options = ["Song", "Artist", "Pick Vibe", "Surprise Me"]
-    if "start_mode" not in st.session_state or st.session_state["start_mode"] not in mode_options:
-        st.session_state["start_mode"] = "Song"
-
-    start_mode = st.radio(
-        "Start Mode",
-        options=mode_options,
-        key="start_mode",
+    st.markdown('<div class="action-title">Choose your move</div>', unsafe_allow_html=True)
+    experience_options = ["Quick Mode", "Self Mix"]
+    if "experience_mode" not in st.session_state or st.session_state["experience_mode"] not in experience_options:
+        st.session_state["experience_mode"] = "Self Mix"
+    experience_mode = st.radio(
+        "Mix Mode",
+        options=experience_options,
+        key="experience_mode",
         horizontal=True,
+        label_visibility="collapsed",
     )
 
-    if start_mode == "Song":
+    if experience_mode == "Quick Mode":
+        vibe_options = list(PERSONALITY_PROFILES.keys())
+        selected_vibe = st.radio(
+            "Vibe Options",
+            options=vibe_options,
+            key="selected_vibe_option",
+            horizontal=True,
+        )
+        vibe_seed, vibe_description = personality_seed_option(data, selected_vibe)
+        st.caption(vibe_description)
+        st.success(f"Vibe starter: {vibe_seed}")
+        return {vibe_seed: 1.0}, {
+            "experience_mode": "Quick Mode",
+            "quick_vibe": selected_vibe,
+        }
+
+    start_mode_options = ["Pick Songs", "Pick Artists", "Surprise Me"]
+    if "start_mode" not in st.session_state or st.session_state["start_mode"] not in start_mode_options:
+        st.session_state["start_mode"] = "Pick Songs"
+    start_mode = st.radio(
+        "How to Start",
+        options=start_mode_options,
+        key="start_mode",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    if start_mode == "Pick Songs":
         st.caption("Choose songs (search enabled). Max 5 total picks combined with artists.")
         song_limit = max(0, MAX_SEED_SELECTIONS - len(st.session_state["selected_seed_artists"]))
         if "song_picker_nonce" not in st.session_state:
@@ -819,9 +943,9 @@ def render_seed_experience(data: pd.DataFrame) -> dict[str, float]:
             _toggle_seed_selection("selected_seed_songs", clicked_song, MAX_SEED_SELECTIONS)
 
         _render_final_pick_box()
-        return _build_seed_weights_from_state(data)
+        return _build_seed_weights_from_state(data), {"experience_mode": "Self Mix"}
 
-    if start_mode == "Artist":
+    if start_mode == "Pick Artists":
         st.caption("Choose artists (search enabled). Max 5 total picks combined with songs.")
         artist_limit = max(0, MAX_SEED_SELECTIONS - len(st.session_state["selected_seed_songs"]))
         if "artist_picker_nonce" not in st.session_state:
@@ -855,21 +979,7 @@ def render_seed_experience(data: pd.DataFrame) -> dict[str, float]:
             _toggle_seed_selection("selected_seed_artists", clicked_artist, MAX_SEED_SELECTIONS)
 
         _render_final_pick_box()
-        return _build_seed_weights_from_state(data)
-
-    if start_mode == "Pick Vibe":
-        st.caption("Choose one vibe option. No search.")
-        vibe_options = list(PERSONALITY_PROFILES.keys())
-        selected_vibe = st.radio(
-            "Vibe Options",
-            options=vibe_options,
-            key="selected_vibe_option",
-            horizontal=True,
-        )
-        vibe_seed, vibe_description = personality_seed_option(data, selected_vibe)
-        st.caption(vibe_description)
-        st.success(f"Vibe starter: {vibe_seed}")
-        return {vibe_seed: 1.0}
+        return _build_seed_weights_from_state(data), {"experience_mode": "Self Mix"}
 
     if start_mode == "Surprise Me":
         if "surprise_counter" not in st.session_state:
@@ -889,19 +999,19 @@ def render_seed_experience(data: pd.DataFrame) -> dict[str, float]:
         surprise_seed = str(st.session_state["surprise_seed_track"])
         st.success(f"Random starter: {surprise_seed}")
         st.caption("This mode uses one random song as the only starting point.")
-        return {surprise_seed: 1.0}
-    return {_default_seed_track(data): 1.0}
+        return {surprise_seed: 1.0}, {"experience_mode": "Self Mix"}
+    return {_default_seed_track(data): 1.0}, {"experience_mode": "Self Mix"}
 
 
 def main() -> None:
-    st.set_page_config(page_title="Pulse Gold Recommender", page_icon="🎵", layout="wide")
+    st.set_page_config(page_title="DJ Mixing Station Studio", page_icon="🎵", layout="wide")
     apply_theme()
 
     st.markdown(
         """
         <div class="hero">
-          <h1>Pulse Gold Recommendation App</h1>
-          <p>Content-driven track recommendations with mood shaping and Spotify/YouTube signal blending.</p>
+          <h1>DJ Mixing Station Studio</h1>
+          <p>Shape your sound with smart mood controls and cross-platform signal blending.</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -927,22 +1037,39 @@ def main() -> None:
         st.error("No usable rows found after cleaning the dataset.")
         st.stop()
 
-    seed_weights = render_seed_experience(data)
+    seed_weights, experience_state = render_seed_experience(data)
 
     with st.sidebar:
         st.header("Recommendation Controls")
-        mood = st.selectbox("Mood", options=list(MOOD_ADJUSTMENTS.keys()), index=0)
-        if "spotify_weight_pct" not in st.session_state:
-            st.session_state["spotify_weight_pct"] = 65
-        spotify_weight_pct = st.slider("Platform Bias", 0, 100, key="spotify_weight_pct")
-        youtube_weight_pct = 100 - spotify_weight_pct
-        st.caption(f"Spotify ({spotify_weight_pct}%) <- -> YouTube ({youtube_weight_pct}%)")
-        if "discovery_hits_pct" not in st.session_state:
-            st.session_state["discovery_hits_pct"] = 65
-        discovery_hits_pct = st.slider("Discovery Mode", 0, 100, key="discovery_hits_pct")
-        current_hidden_gems_pct = 100 - discovery_hits_pct
-        st.caption(f"Hits ({discovery_hits_pct}%) <- -> Hidden Gems ({current_hidden_gems_pct}%)")
-        hidden_gems_pct = 100 - discovery_hits_pct
+        if experience_state.get("experience_mode") == "Quick Mode":
+            selected_quick_vibe = str(experience_state.get("quick_vibe", "Focus Flow"))
+            quick_defaults = QUICK_VIBE_DEFAULTS.get(selected_quick_vibe, QUICK_VIBE_DEFAULTS["Focus Flow"])
+            if st.session_state.get("quick_vibe_applied") != selected_quick_vibe:
+                st.session_state["quick_spotify_weight_pct"] = int(quick_defaults["spotify_weight_pct"])
+                st.session_state["quick_discovery_hits_pct"] = int(quick_defaults["discovery_hits_pct"])
+                st.session_state["quick_vibe_applied"] = selected_quick_vibe
+
+            mood = str(quick_defaults["mood"])
+            spotify_weight_pct = st.slider("Platform Bias", 0, 100, key="quick_spotify_weight_pct")
+            youtube_weight_pct = 100 - spotify_weight_pct
+            st.caption(f"Spotify ({spotify_weight_pct}%) <- -> YouTube ({youtube_weight_pct}%)")
+            discovery_hits_pct = st.slider("Discovery Mode", 0, 100, key="quick_discovery_hits_pct")
+            hidden_gems_pct = 100 - discovery_hits_pct
+            st.caption(f"Hits ({discovery_hits_pct}%) <- -> Hidden Gems ({hidden_gems_pct}%)")
+        else:
+            self_mix_vibe = st.selectbox("Vibe Options", options=list(PERSONALITY_PROFILES.keys()), index=0, key="self_mix_vibe_option")
+            mood = str(QUICK_VIBE_DEFAULTS.get(self_mix_vibe, QUICK_VIBE_DEFAULTS["Focus Flow"])["mood"])
+            if "spotify_weight_pct" not in st.session_state:
+                st.session_state["spotify_weight_pct"] = 65
+            spotify_weight_pct = st.slider("Platform Bias", 0, 100, key="spotify_weight_pct")
+            youtube_weight_pct = 100 - spotify_weight_pct
+            st.caption(f"Spotify ({spotify_weight_pct}%) <- -> YouTube ({youtube_weight_pct}%)")
+            if "discovery_hits_pct" not in st.session_state:
+                st.session_state["discovery_hits_pct"] = 65
+            discovery_hits_pct = st.slider("Discovery Mode", 0, 100, key="discovery_hits_pct")
+            hidden_gems_pct = 100 - discovery_hits_pct
+            st.caption(f"Hits ({discovery_hits_pct}%) <- -> Hidden Gems ({hidden_gems_pct}%)")
+
         target_minutes = st.slider("Total Playlist Minutes (±3 mins)", 30, 300, 120)
         lower_window = target_minutes - PLAYLIST_TOLERANCE_MINUTES
         upper_window = target_minutes + PLAYLIST_TOLERANCE_MINUTES
@@ -951,15 +1078,23 @@ def main() -> None:
             f"({format_hours_minutes(lower_window)} to {format_hours_minutes(upper_window)})"
         )
 
-    recommendations = recommend_tracks(
+    seed_weight_items = tuple(sorted((str(name), float(weight)) for name, weight in seed_weights.items()))
+    preferred_artist_weight_items: tuple[tuple[str, float], ...] = ()
+    if experience_state.get("experience_mode") == "Self Mix":
+        preferred_artist_weight_items = tuple(sorted(_build_preferred_artist_weights(data).items()))
+    include_seed_tracks = discovery_hits_pct == 100
+
+    recommendations = recommend_tracks_cached(
         data=data,
-        seed_display_name=seed_weights,
+        seed_weight_items=seed_weight_items,
         mood=mood,
         spotify_weight=spotify_weight_pct / 100.0,
         discovery_mode=hidden_gems_pct / 100.0,
         top_k=180,
+        exclude_seed_tracks=not include_seed_tracks,
+        preferred_artist_weight_items=preferred_artist_weight_items,
     )
-    playlist = build_duration_playlist(
+    playlist = build_duration_playlist_cached(
         recommendations=recommendations,
         target_minutes=target_minutes,
         tolerance_minutes=PLAYLIST_TOLERANCE_MINUTES,

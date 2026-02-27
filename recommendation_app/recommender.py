@@ -48,6 +48,38 @@ def _clean_text(value: object) -> str:
     return re.sub(r"[^a-z0-9 ]+", " ", str(value).lower()).strip()
 
 
+def _split_artist_tokens(text: object) -> list[str]:
+    raw = str(text or "")
+    if not raw:
+        return []
+    parts = re.split(r",|&| and ", raw, flags=re.IGNORECASE)
+    return [part.strip() for part in parts if part and str(part).strip()]
+
+
+def _extract_featured_artists(track: object) -> list[str]:
+    track_text = str(track or "")
+    if not track_text:
+        return []
+
+    match = re.search(r"\((?:feat\.?|ft\.?)\s*([^)]+)\)", track_text, flags=re.IGNORECASE)
+    if not match:
+        match = re.search(r"(?:feat\.?|ft\.?)\s+(.+)$", track_text, flags=re.IGNORECASE)
+    if not match:
+        return []
+
+    featured_block = match.group(1)
+    return _split_artist_tokens(featured_block)
+
+
+def _strip_feature_from_track(track: object) -> str:
+    track_text = str(track or "")
+    if not track_text:
+        return ""
+    stripped = re.sub(r"\s*\((?:feat\.?|ft\.?).*?\)", "", track_text, flags=re.IGNORECASE)
+    stripped = re.sub(r"\s*(?:feat\.?|ft\.?)\s+.+$", "", stripped, flags=re.IGNORECASE)
+    return stripped.strip()
+
+
 def _extract_spotify_track_id(uri: object, url_spotify: object) -> str | None:
     uri_text = str(uri or "")
     uri_match = re.search(r"spotify:track:([A-Za-z0-9]+)", uri_text)
@@ -89,11 +121,17 @@ def _youtube_match_score(title: object, artist: object, track: object) -> float:
     score = 0.0
     artist_text = _clean_text(artist)
     track_text = _clean_text(track)
+    core_track_text = _clean_text(_strip_feature_from_track(track))
+    featured_artists = [_clean_text(name) for name in _extract_featured_artists(track)]
 
     if artist_text and artist_text in title_text:
         score += 1.0
-    if track_text and track_text in title_text:
+    if core_track_text and core_track_text in title_text:
         score += 1.0
+    if track_text and track_text in title_text:
+        score += 0.4
+    featured_hits = sum(1 for name in featured_artists if name and name in title_text)
+    score += min(1.0, featured_hits * 0.35)
     return score
 
 
@@ -110,10 +148,11 @@ def _build_youtube_link(row: pd.Series) -> str:
     video_id = _extract_youtube_video_id(row.get("url_youtube"))
     title_match = _youtube_match_score(row.get("title"), row.get("artist"), row.get("track"))
 
-    if video_id and title_match >= 2.0:
+    if video_id and title_match >= 1.2:
         return f"https://www.youtube.com/watch?v={video_id}"
 
-    query = quote_plus(f"{row.get('artist', '')} {row.get('track', '')} official".strip())
+    core_track = _strip_feature_from_track(row.get("track"))
+    query = quote_plus(f"{row.get('artist', '')} {core_track or row.get('track', '')} official".strip())
     return f"https://www.youtube.com/results?search_query={query}" if query else "https://www.youtube.com"
 
 
@@ -200,8 +239,33 @@ def prepare_music_data(df: pd.DataFrame) -> pd.DataFrame:
     data["spotify_link"] = data.apply(_build_spotify_link, axis=1)
     data["youtube_link"] = data.apply(_build_youtube_link, axis=1)
     data["display_name"] = data["artist"] + " - " + data["track"]
+    data["artist_clean"] = data["artist"].apply(_clean_text)
+    data["featured_artists"] = data["track"].apply(_extract_featured_artists)
+    data["featured_artist_norms"] = data["featured_artists"].apply(
+        lambda artists: "|".join(sorted({_clean_text(name) for name in artists if _clean_text(name)}))
+    )
+    data["artist_is_featured_on_track"] = data.apply(
+        lambda row: row["artist_clean"] in set(row["featured_artist_norms"].split("|")) if row["featured_artist_norms"] else False,
+        axis=1,
+    )
+    data["spotify_track_id"] = data.apply(lambda row: _extract_spotify_track_id(row.get("uri"), row.get("url_spotify")), axis=1)
+    data["youtube_video_id"] = data["url_youtube"].apply(_extract_youtube_video_id)
+    fallback_song_key = data["artist_clean"] + "::" + data["track"].apply(_clean_text)
+    data["canonical_song_key"] = np.where(
+        data["spotify_track_id"].fillna("").astype(str).str.len() > 0,
+        "sp:" + data["spotify_track_id"].fillna("").astype(str),
+        np.where(
+            data["youtube_video_id"].fillna("").astype(str).str.len() > 0,
+            "yt:" + data["youtube_video_id"].fillna("").astype(str),
+            "fb:" + fallback_song_key,
+        ),
+    )
 
-    deduped = data.sort_values(["link_quality_score", "momentum_score", "views", "stream"], ascending=False)
+    deduped = data.sort_values(
+        ["artist_is_featured_on_track", "link_quality_score", "momentum_score", "views", "stream"],
+        ascending=[True, False, False, False, False],
+    )
+    deduped = deduped.drop_duplicates(subset=["canonical_song_key"], keep="first")
     deduped = deduped.drop_duplicates(subset=["artist", "track"], keep="first")
     return deduped.reset_index(drop=True)
 
@@ -218,7 +282,14 @@ def recommend_tracks(
     spotify_weight: float,
     discovery_mode: float,
     top_k: int = 12,
+    exclude_seed_tracks: bool = True,
+    preferred_artist_weights: dict[str, float] | None = None,
 ) -> pd.DataFrame:
+    required_scoring_columns = {"display_name", "artist", "stream_norm", "views_norm", "popularity_norm", "momentum_score"}
+    missing_columns = [col for col in [*FEATURE_COLUMNS, *required_scoring_columns] if col not in data.columns]
+    if missing_columns:
+        raise ValueError(f"Missing scoring columns: {', '.join(sorted(set(missing_columns)))}")
+
     valid_names = set(data["display_name"])
     seed_weights: dict[str, float] = {}
 
@@ -242,7 +313,7 @@ def recommend_tracks(
     total_weight = float(sum(seed_weights.values()))
     seed_weights = {name: (weight / total_weight) for name, weight in seed_weights.items()}
 
-    features = _zscore(data[FEATURE_COLUMNS].astype(float))
+    features = _zscore(data[FEATURE_COLUMNS].astype(float)).fillna(0.0)
     target = pd.Series(0.0, index=features.columns)
     for seed_name, seed_weight in seed_weights.items():
         seed_index = int(data.index[data["display_name"] == seed_name][0])
@@ -260,24 +331,76 @@ def recommend_tracks(
     spotify_weight = float(np.clip(spotify_weight, 0, 1))
     discovery_mode = float(np.clip(discovery_mode, 0, 1))
 
-    platform_score = spotify_weight * data["stream_norm"] + (1 - spotify_weight) * data["views_norm"]
-    discovery_score = (1 - discovery_mode) * data["popularity_norm"] + discovery_mode * (1 - data["popularity_norm"])
+    stream_norm = pd.to_numeric(data["stream_norm"], errors="coerce").fillna(0.0)
+    views_norm = pd.to_numeric(data["views_norm"], errors="coerce").fillna(0.0)
+    popularity_norm = pd.to_numeric(data["popularity_norm"], errors="coerce").fillna(0.0)
+    momentum_score = pd.to_numeric(data["momentum_score"], errors="coerce").fillna(0.0)
+
+    platform_score = spotify_weight * stream_norm + (1 - spotify_weight) * views_norm
+    discovery_score = (1 - discovery_mode) * popularity_norm + discovery_mode * (1 - popularity_norm)
+    hits_preference = 1.0 - discovery_mode
+
+    seed_set = set(seed_weights.keys())
+    raw_artist_weights = {
+        str(name).strip(): float(weight)
+        for name, weight in (preferred_artist_weights or {}).items()
+        if str(name).strip() and float(weight) > 0
+    }
+    if raw_artist_weights:
+        total_artist_weight = float(sum(raw_artist_weights.values()))
+        normalized_artist_weights = {k: (v / total_artist_weight) for k, v in raw_artist_weights.items()}
+    else:
+        normalized_artist_weights = {}
+
+    artist_clean_series = (
+        data["artist_clean"].astype(str)
+        if "artist_clean" in data.columns
+        else data["artist"].apply(_clean_text).astype(str)
+    )
+    weight_by_clean_artist = {_clean_text(name): weight for name, weight in normalized_artist_weights.items()}
+    artist_weight_direct = artist_clean_series.map(weight_by_clean_artist).fillna(0.0).to_numpy(dtype=float)
+    featured_norms_series = (
+        data["featured_artist_norms"].fillna("").astype(str)
+        if "featured_artist_norms" in data.columns
+        else pd.Series([""] * len(data), index=data.index, dtype=str)
+    )
+    featured_lists = featured_norms_series.str.split("|")
+    featured_weight = np.array(
+        [sum(weight_by_clean_artist.get(name, 0.0) for name in names if name) for names in featured_lists],
+        dtype=float,
+    )
+    artist_weight = np.clip(artist_weight_direct + 0.8 * featured_weight, 0.0, 2.0)
+    low_popularity = 1.0 - popularity_norm.to_numpy(dtype=float)
+
+    seed_bonus = np.where(data["display_name"].isin(seed_set), 0.02 + 0.26 * hits_preference, 0.0)
+    artist_hits_bonus = artist_weight * (0.12 * hits_preference)
+    artist_hidden_bonus = artist_weight * discovery_mode * low_popularity * (0.08 + 0.22 * similarity_score)
+    artist_bonus = artist_hits_bonus + artist_hidden_bonus
 
     final_score = (
         0.58 * similarity_score
         + 0.16 * platform_score
-        + 0.16 * data["momentum_score"]
+        + 0.16 * momentum_score
         + 0.10 * discovery_score
+        + seed_bonus
+        + artist_bonus
     )
 
     scored = data.copy()
     scored["similarity_score"] = similarity_score
     scored["platform_score"] = platform_score
     scored["discovery_score"] = discovery_score
+    scored["seed_bonus"] = seed_bonus
+    scored["artist_bonus"] = artist_bonus
     scored["recommendation_score"] = final_score
 
-    results = scored.loc[~scored["display_name"].isin(seed_weights.keys())]
+    if exclude_seed_tracks:
+        results = scored.loc[~scored["display_name"].isin(seed_weights.keys())]
+    else:
+        results = scored
     results = results.sort_values(["recommendation_score", "momentum_score"], ascending=False)
+    if top_k <= 0:
+        return results.head(0).reset_index(drop=True)
     return results.head(top_k).reset_index(drop=True)
 
 
@@ -291,7 +414,16 @@ def build_duration_playlist(
     if recommendations.empty:
         return recommendations.copy()
 
+    candidate_limit = int(np.clip(candidate_limit, 1, 500))
+    max_tracks = int(np.clip(max_tracks, 1, 120))
+    tolerance_minutes = int(max(0, tolerance_minutes))
+    target_minutes = int(max(1, target_minutes))
+
     candidates = recommendations.head(candidate_limit).copy().reset_index(drop=True)
+    if "recommendation_score" not in candidates.columns:
+        fallback_momentum = pd.to_numeric(candidates.get("momentum_score"), errors="coerce").fillna(0.0)
+        candidates["recommendation_score"] = fallback_momentum
+
     durations_ms = pd.to_numeric(candidates.get("duration_ms"), errors="coerce").fillna(0)
     positive_ms = durations_ms[durations_ms > 0]
     fallback_ms = float(positive_ms.median() if not positive_ms.empty else 180_000)
