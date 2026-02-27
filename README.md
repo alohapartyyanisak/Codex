@@ -4,7 +4,7 @@
 DJ Mixing Station Studio is a local-first music recommendation app that blends Spotify and YouTube signals with mood controls.
 
 The main data source is the Kaggle dataset:
-- `salvatorerastelli/spotify-and-youtube`
+- [salvatorerastelli/spotify-and-youtube](https://www.kaggle.com/datasets/salvatorerastelli/spotify-and-youtube)
 
 At runtime, the app can:
 1. Download and use the Kaggle dataset through `kagglehub`
@@ -47,3 +47,5 @@ Open in browser (default):
 
 If Kaggle credentials are not set, upload a compatible CSV directly in the app.
 
+## More details here:
+[Your Taste, Your Vibe: How DJ Mixing Station Studio Reimagines Recommendations](https://medium.com/@yanisakk26/your-taste-your-vibe-how-dj-mixing-station-studio-reimagines-recommendations-20a62dd59351)
