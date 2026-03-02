@@ -59,9 +59,6 @@ If Kaggle credentials are not set, upload a compatible CSV directly in the app.
 ## Debug and Analysis Outputs
 - EDA notebook:
   - `recommendation_app/offline-v2/ds/combined_dataset_eda.ipynb`
-- Exported CSVs:
-  - `recommendation_app/offline-v2/ds/combined_dataset_raw.csv`
-  - `recommendation_app/offline-v2/ds/combined_dataset_prepared.csv`
 - Change log from v1 to v2:
   - `recommendation_app/offline-v2/doc/document_change.md`
 
