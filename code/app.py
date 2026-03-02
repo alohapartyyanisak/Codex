@@ -12,7 +12,15 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 try:
-    from recommendation_app.recommender import (
+    from recommendation_app.youtube_live_resolver import resolve_best_youtube_live
+except ModuleNotFoundError:
+    try:
+        from youtube_live_resolver import resolve_best_youtube_live  # type: ignore
+    except ModuleNotFoundError:
+        resolve_best_youtube_live = None  # type: ignore
+
+try:
+    from recommendation_app.recommender_v2_core import (
         MOOD_ADJUSTMENTS,
         build_duration_playlist,
         format_compact_number,
@@ -20,7 +28,7 @@ try:
         recommend_tracks,
     )
 except ModuleNotFoundError:
-    from recommender import (
+    from recommender_v2_core import (
         MOOD_ADJUSTMENTS,
         build_duration_playlist,
         format_compact_number,
@@ -567,6 +575,55 @@ def extract_youtube_video_id(url: object) -> str | None:
 def normalize_youtube_watch_url(url: object) -> str | None:
     video_id = extract_youtube_video_id(url)
     return f"https://www.youtube.com/watch?v={video_id}" if video_id else None
+
+
+@st.cache_data(show_spinner=False, ttl=86400)
+def resolve_live_youtube_watch_url(
+    artist: str,
+    track: str,
+    artist_credits_json: str = "",
+) -> tuple[str, str, float]:
+    if resolve_best_youtube_live is None:
+        return "", "resolver unavailable", 0.0
+
+    result = resolve_best_youtube_live(
+        artist_owner=artist,
+        track=track,
+        artist_credits_json=artist_credits_json,
+        max_results=10,
+        timeout=8,
+    )
+    return (
+        str(result.get("watch_url", "") or ""),
+        str(result.get("reason", "") or ""),
+        float(result.get("score", 0.0) or 0.0),
+    )
+
+
+def prefer_direct_youtube_url(youtube_link: object, fallback_url: object) -> str:
+    direct_from_link = normalize_youtube_watch_url(youtube_link)
+    if direct_from_link:
+        return direct_from_link
+    direct_from_fallback = normalize_youtube_watch_url(fallback_url)
+    if direct_from_fallback:
+        return direct_from_fallback
+    return str(youtube_link or fallback_url or "").strip()
+
+
+def resolve_playback_youtube_url(row: pd.Series) -> str:
+    direct_watch = normalize_youtube_watch_url(row.get("youtube_link")) or normalize_youtube_watch_url(row.get("url_youtube"))
+    if direct_watch:
+        return direct_watch
+
+    live_watch, _, _ = resolve_live_youtube_watch_url(
+        str(row.get("artist", "")),
+        str(row.get("track", "")),
+        str(row.get("artist_credits", "")),
+    )
+    if live_watch:
+        return live_watch
+
+    return str(row.get("youtube_link") or row.get("url_youtube") or "").strip()
 
 
 def render_platform_link(label: str, url: str) -> None:
@@ -1129,7 +1186,7 @@ def main() -> None:
         axis=1,
     )
     queue["youtube_url"] = queue.apply(
-        lambda row: row.get("youtube_link") or row.get("url_youtube") or "",
+        resolve_playback_youtube_url,
         axis=1,
     )
     queue["queue_label"] = queue.apply(

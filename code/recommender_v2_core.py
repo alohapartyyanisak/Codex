@@ -146,9 +146,7 @@ def _build_spotify_link(row: pd.Series) -> str:
 
 def _build_youtube_link(row: pd.Series) -> str:
     video_id = _extract_youtube_video_id(row.get("url_youtube"))
-    title_match = _youtube_match_score(row.get("title"), row.get("artist"), row.get("track"))
-
-    if video_id and title_match >= 1.2:
+    if video_id:
         return f"https://www.youtube.com/watch?v={video_id}"
 
     core_track = _strip_feature_from_track(row.get("track"))
@@ -176,6 +174,48 @@ def _normalize_series(series: pd.Series) -> pd.Series:
     if np.isclose(min_value, max_value):
         return pd.Series(np.zeros(len(series)), index=series.index, dtype=float)
     return (series - min_value) / (max_value - min_value)
+
+
+def _drop_duplicate_rows_by_nonempty_key(frame: pd.DataFrame, key_col: str) -> pd.DataFrame:
+    if key_col not in frame.columns:
+        return frame
+    out = frame.copy()
+    key_series = out[key_col].fillna("").astype(str).str.strip()
+    nonempty = key_series != ""
+    if not nonempty.any():
+        return out
+    duplicate_nonempty = key_series[nonempty].duplicated(keep="first")
+    drop_index = duplicate_nonempty[duplicate_nonempty].index
+    if len(drop_index) == 0:
+        return out
+    return out.drop(index=drop_index)
+
+
+def _dedupe_ranked_candidates_by_links(frame: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove duplicate candidate rows that map to the same Spotify track or YouTube video.
+    Priority is preserved by expected pre-sorting on recommendation_score/momentum.
+    """
+    out = frame.copy()
+
+    if "spotify_track_id" not in out.columns:
+        spotify_source = out.get("spotify_link", out.get("url_spotify", ""))
+        out["spotify_track_id"] = (
+            spotify_source.astype(str).apply(lambda value: _extract_spotify_track_id("", value))
+            if isinstance(spotify_source, pd.Series)
+            else ""
+        )
+    if "youtube_video_id" not in out.columns:
+        youtube_source = out.get("youtube_link", out.get("url_youtube", ""))
+        out["youtube_video_id"] = (
+            youtube_source.astype(str).apply(_extract_youtube_video_id)
+            if isinstance(youtube_source, pd.Series)
+            else ""
+        )
+
+    out = _drop_duplicate_rows_by_nonempty_key(out, "spotify_track_id")
+    out = _drop_duplicate_rows_by_nonempty_key(out, "youtube_video_id")
+    return out
 
 
 def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -399,6 +439,7 @@ def recommend_tracks(
     else:
         results = scored
     results = results.sort_values(["recommendation_score", "momentum_score"], ascending=False)
+    results = _dedupe_ranked_candidates_by_links(results)
     if top_k <= 0:
         return results.head(0).reset_index(drop=True)
     return results.head(top_k).reset_index(drop=True)
@@ -420,6 +461,7 @@ def build_duration_playlist(
     target_minutes = int(max(1, target_minutes))
 
     candidates = recommendations.head(candidate_limit).copy().reset_index(drop=True)
+    candidates = _dedupe_ranked_candidates_by_links(candidates).reset_index(drop=True)
     if "recommendation_score" not in candidates.columns:
         fallback_momentum = pd.to_numeric(candidates.get("momentum_score"), errors="coerce").fillna(0.0)
         candidates["recommendation_score"] = fallback_momentum
