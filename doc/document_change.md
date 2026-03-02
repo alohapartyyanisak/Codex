@@ -51,9 +51,6 @@ This file summarizes what changed from `offline-v1` to `offline-v2`.
 ## 7. Data Science Deliverables Added
 - EDA notebook:
   - `recommendation_app/offline-v2/ds/combined_dataset_eda.ipynb`
-- Exported analysis datasets:
-  - `recommendation_app/offline-v2/ds/combined_dataset_raw.csv`
-  - `recommendation_app/offline-v2/ds/combined_dataset_prepared.csv`
 
 ## 8. Validation Completed (v2)
 - Normal, edge, extreme, and strange test matrices executed.
