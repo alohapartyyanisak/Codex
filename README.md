@@ -1,20 +1,23 @@
-# DJ Mixing Station Studio (offline-v1)
+# DJ Mixing Station Studio (offline-v2)
 
 ## Short Story
 DJ Mixing Station Studio is a local-first music recommendation app that blends Spotify and YouTube signals with mood controls.
 
-The main data source is the Kaggle dataset:
-- [salvatorerastelli/spotify-and-youtube](https://www.kaggle.com/datasets/salvatorerastelli/spotify-and-youtube)
+The v2 build uses two Kaggle datasets and merges them:
+- baseline: `salvatorerastelli/spotify-and-youtube`
+- expansion: `solomonameh/spotify-music-dataset`
 
 At runtime, the app can:
-1. Download and use the Kaggle dataset through `kagglehub`
-2. Accept a user-uploaded CSV as fallback
+1. Download/use both Kaggle datasets through `kagglehub` and merge them.
+2. Accept a user-uploaded CSV as fallback.
 
-This makes it easy to run the app offline-first after initial data setup, while still supporting custom datasets.
-
-## Core App Files
-- `recommendation_app/app.py`: Streamlit UI and interaction flow
-- `recommendation_app/recommender.py`: data prep, scoring logic, ranking, and playlist duration optimizer
+## Core v2 Files
+- `recommendation_app/offline-v2/code/application_v2.py`: Streamlit UI entrypoint (v2)
+- `recommendation_app/offline-v2/code/data_upgrade_v2.py`: dual-source Kaggle merge pipeline
+- `recommendation_app/offline-v2/code/recommender_v2_core.py`: core scoring and playlist engine
+- `recommendation_app/offline-v2/code/recommender_v2_adapter.py`: v2 prep/scoring adapter
+- `recommendation_app/offline-v2/code/youtube_live_resolver.py`: YouTube resolver + cache/quota logic
+- `recommendation_app/offline-v2/code/resolver_quota_metrics.py`: resolver monitoring metrics
 
 ## How To Run
 From repo root:
@@ -36,16 +39,31 @@ export KAGGLE_USERNAME=<your_kaggle_username>
 export KAGGLE_KEY=<your_kaggle_key>
 ```
 
-Run Streamlit:
+Optional YouTube resolver key:
 
 ```bash
-streamlit run recommendation_app/app.py --server.fileWatcherType none
+export YOUTUBE_API_KEY=<your_youtube_api_key>
 ```
 
-Open in browser (default):
+Run Streamlit (v2):
+
+```bash
+streamlit run recommendation_app/offline-v2/code/application_v2.py --server.fileWatcherType none
+```
+
+Open in browser:
 - `http://localhost:8501`
 
 If Kaggle credentials are not set, upload a compatible CSV directly in the app.
+
+## Debug and Analysis Outputs
+- EDA notebook:
+  - `recommendation_app/offline-v2/ds/combined_dataset_eda.ipynb`
+- Exported CSVs:
+  - `recommendation_app/offline-v2/ds/combined_dataset_raw.csv`
+  - `recommendation_app/offline-v2/ds/combined_dataset_prepared.csv`
+- Change log from v1 to v2:
+  - `recommendation_app/offline-v2/doc/document_change.md`
 
 ## More details here:
 [Your Taste, Your Vibe: How DJ Mixing Station Studio Reimagines Recommendations](https://medium.com/@yanisakk26/your-taste-your-vibe-how-dj-mixing-station-studio-reimagines-recommendations-20a62dd59351)
